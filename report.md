@@ -74,7 +74,99 @@ bootstacktop:           // 栈顶（高地址）
 
 ---
 
-## 三、GDB验证结果与分析
+## 三、GDB 验证结果与分析（基于本次终端输出）
+
+为验证 `entry.S` 的两项职责（**立栈**与**交棒**），我在 `kern_entry` / `kern_init` / `cprintf` / `sbi_console_putchar` 等关键点设置断点，并逐步观察寄存器与指令流。
+
+### 3.1 成功进入 C 端入口 `kern_init`
+命中 `kern_init` 的断点：
+```gdb
+Breakpoint 1, kern_init () at kern/init/init.c:8
+8           memset(edata, 0, end - edata);
+```
+**结论**：说明 `entry.S` 的 `tail kern_init` 已完成“只去不回”的交接，控制权从汇编世界成功转入 C 世界。
+
+---
+
+### 3.2 启动栈初始化正确（`sp == bootstacktop`）
+现场查询启动栈符号与寄存器：
+```gdb
+(gdb) p/x &bootstack
+$1 = 0x80201000
+(gdb) p/x &bootstacktop
+$2 = 0x80203000
+(gdb) info reg sp
+sp             0x80203000       0x80203000 <SBI_CONSOLE_PUTCHAR>
+(gdb) p/x &bootstacktop - &bootstack
+$3 = 0x2000
+```
+**解读**：
+- `sp = 0x80203000 = &bootstacktop`，说明 `la sp, bootstacktop` 生效；  
+- `bootstacktop - bootstack = 0x2000 (= 8 KiB)`，与 `KSTACKSIZE` 一致；  
+- GDB 将 `sp` 地址标注为 `<SBI_CONSOLE_PUTCHAR>` 仅是“最近符号”提示；栈从高地址向低地址增长，函数序言会先 `addi sp, sp, -N` 再写入，不会踩该符号，**属于正常现象**。
+
+---
+
+### 3.3 `kern_init` 函数序言与参数准备（清 `.bss` 前）
+查看 `kern_init` 附近的指令：
+```gdb
+(gdb) x/6i $pc
+=> 0x80200012 <kern_init+8>:    auipc   a2,0x3
+   0x80200016 <kern_init+12>:   addi    a2,a2,-10
+   0x8020001a <kern_init+16>:   addi    sp,sp,-16
+   0x8020001c <kern_init+18>:   li      a1,0
+   0x8020001e <kern_init+20>:   sub     a2,a2,a0
+   0x80200020 <kern_init+22>:   sd      ra,8(sp)
+```
+并尝试回溯：
+```gdb
+(gdb) where
+#0  0x0000000080200012 in kern_init () at kern/init/init.c:8
+#1  0x0000000080000a02 in ?? ()
+Backtrace stopped: previous frame inner to this frame (corrupt stack?)
+```
+**解读**：
+- `addi sp, sp, -16`、`sd ra, 8(sp)` 等是标准的函数序言；  
+- `a0/a1/a2` 的设置对应 `memset(edata, 0, end-edata)` 的参数准备；  
+- 回溯出现 “corrupt stack?” 是因为入口使用 **`tail`**（尾调用不写返回地址），GDB 试图回溯上一帧时落到 OpenSBI 区域，**这是预期现象而非错误**。
+
+---
+
+### 3.4 输出链路畅通（`cprintf → sbi_console_putchar → ecall`）
+命中 `cprintf`：
+```gdb
+Breakpoint 2, cprintf (fmt=fmt@entry=0x802004c8 "%s\n\n")
+    at kern/libs/stdio.c:40
+40          va_start(ap, fmt);
+(gdb) x/6i $pc
+=> 0x80200054 <cprintf>:        addi    sp,sp,-96
+   0x80200056 <cprintf+2>:      addi    t1,sp,40
+   0x8020005a <cprintf+6>:      sd      a1,40(sp)
+   0x8020005c <cprintf+8>:      sd      a2,48(sp)
+   0x8020005e <cprintf+10>:     sd      a3,56(sp)
+   0x80200060 <cprintf+12>:     mv      a2,a0
+```
+继续到 SBI 字符输出处：
+```gdb
+Breakpoint 3, sbi_console_putchar (ch=40 '(') at libs/sbi.c:33
+33          sbi_call(SBI_CONSOLE_PUTCHAR, ch, 0, 0);
+```
+**解读**：
+- `cprintf` 进入后建立自己的栈帧，准备可变参；  
+- 在 `sbi_console_putchar` 命中时 `ch=40 '('`，正是启动字符串 **"(THU.CST) os is loading ..."** 的第一个字符；  
+- 随后 `sbi_call` 通过设置寄存器并执行 `ecall` 进入 M 模式，由 OpenSBI 完成真正的字符输出。
+
+---
+
+### 3.5 小结
+- **交棒成功**：命中 `kern_init`，`tail kern_init` 工作正常；  
+- **立栈成功**：`sp==bootstacktop`，栈大小 8 KiB，页对齐 & ABI 对齐均满足；  
+- **C 环境就绪**：`kern_init` 序言与参数设置正确；  
+- **打印链路可达**：`cprintf → sbi_console_putchar → ecall` 全链路触发；  
+- **回溯提示可解释**：因尾调用不写返回地址，GDB 回溯出现 OpenSBI 地址属预期。
+
+**结论**：本次 GDB 观察与理论分析完全一致，`entry.S` 在“最小内核”中顺利完成 **“搭栈桥 → 交接到 C”** 的使命。
+
 
 我用GDB设置了几个关键断点，具体观察启动过程中的各个环节：
 
