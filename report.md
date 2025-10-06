@@ -74,101 +74,9 @@ bootstacktop:           // 栈顶（高地址）
 
 ---
 
-## 三、GDB 验证结果与分析（基于本次终端输出）
+## 三、GDB验证结果与分析
 
-为验证 `entry.S` 的两项职责（**立栈**与**交棒**），我在 `kern_entry` / `kern_init` / `cprintf` / `sbi_console_putchar` 等关键点设置断点，并逐步观察寄存器与指令流。
-
-### 3.1 成功进入 C 端入口 `kern_init`
-命中 `kern_init` 的断点：
-```gdb
-Breakpoint 1, kern_init () at kern/init/init.c:8
-8           memset(edata, 0, end - edata);
-```
-**结论**：说明 `entry.S` 的 `tail kern_init` 已完成“只去不回”的交接，控制权从汇编世界成功转入 C 世界。
-
----
-
-### 3.2 启动栈初始化正确（`sp == bootstacktop`）
-现场查询启动栈符号与寄存器：
-```gdb
-(gdb) p/x &bootstack
-$1 = 0x80201000
-(gdb) p/x &bootstacktop
-$2 = 0x80203000
-(gdb) info reg sp
-sp             0x80203000       0x80203000 <SBI_CONSOLE_PUTCHAR>
-(gdb) p/x &bootstacktop - &bootstack
-$3 = 0x2000
-```
-**解读**：
-- `sp = 0x80203000 = &bootstacktop`，说明 `la sp, bootstacktop` 生效；  
-- `bootstacktop - bootstack = 0x2000 (= 8 KiB)`，与 `KSTACKSIZE` 一致；  
-- GDB 将 `sp` 地址标注为 `<SBI_CONSOLE_PUTCHAR>` 仅是“最近符号”提示；栈从高地址向低地址增长，函数序言会先 `addi sp, sp, -N` 再写入，不会踩该符号，**属于正常现象**。
-
----
-
-### 3.3 `kern_init` 函数序言与参数准备（清 `.bss` 前）
-查看 `kern_init` 附近的指令：
-```gdb
-(gdb) x/6i $pc
-=> 0x80200012 <kern_init+8>:    auipc   a2,0x3
-   0x80200016 <kern_init+12>:   addi    a2,a2,-10
-   0x8020001a <kern_init+16>:   addi    sp,sp,-16
-   0x8020001c <kern_init+18>:   li      a1,0
-   0x8020001e <kern_init+20>:   sub     a2,a2,a0
-   0x80200020 <kern_init+22>:   sd      ra,8(sp)
-```
-并尝试回溯：
-```gdb
-(gdb) where
-#0  0x0000000080200012 in kern_init () at kern/init/init.c:8
-#1  0x0000000080000a02 in ?? ()
-Backtrace stopped: previous frame inner to this frame (corrupt stack?)
-```
-**解读**：
-- `addi sp, sp, -16`、`sd ra, 8(sp)` 等是标准的函数序言；  
-- `a0/a1/a2` 的设置对应 `memset(edata, 0, end-edata)` 的参数准备；  
-- 回溯出现 “corrupt stack?” 是因为入口使用 **`tail`**（尾调用不写返回地址），GDB 试图回溯上一帧时落到 OpenSBI 区域，**这是预期现象而非错误**。
-
----
-
-### 3.4 输出链路畅通（`cprintf → sbi_console_putchar → ecall`）
-命中 `cprintf`：
-```gdb
-Breakpoint 2, cprintf (fmt=fmt@entry=0x802004c8 "%s\n\n")
-    at kern/libs/stdio.c:40
-40          va_start(ap, fmt);
-(gdb) x/6i $pc
-=> 0x80200054 <cprintf>:        addi    sp,sp,-96
-   0x80200056 <cprintf+2>:      addi    t1,sp,40
-   0x8020005a <cprintf+6>:      sd      a1,40(sp)
-   0x8020005c <cprintf+8>:      sd      a2,48(sp)
-   0x8020005e <cprintf+10>:     sd      a3,56(sp)
-   0x80200060 <cprintf+12>:     mv      a2,a0
-```
-继续到 SBI 字符输出处：
-```gdb
-Breakpoint 3, sbi_console_putchar (ch=40 '(') at libs/sbi.c:33
-33          sbi_call(SBI_CONSOLE_PUTCHAR, ch, 0, 0);
-```
-**解读**：
-- `cprintf` 进入后建立自己的栈帧，准备可变参；  
-- 在 `sbi_console_putchar` 命中时 `ch=40 '('`，正是启动字符串 **"(THU.CST) os is loading ..."** 的第一个字符；  
-- 随后 `sbi_call` 通过设置寄存器并执行 `ecall` 进入 M 模式，由 OpenSBI 完成真正的字符输出。
-
----
-
-### 3.5 小结
-- **交棒成功**：命中 `kern_init`，`tail kern_init` 工作正常；  
-- **立栈成功**：`sp==bootstacktop`，栈大小 8 KiB，页对齐 & ABI 对齐均满足；  
-- **C 环境就绪**：`kern_init` 序言与参数设置正确；  
-- **打印链路可达**：`cprintf → sbi_console_putchar → ecall` 全链路触发；  
-- **回溯提示可解释**：因尾调用不写返回地址，GDB 回溯出现 OpenSBI 地址属预期。
-
-**结论**：本次 GDB 观察与理论分析完全一致，`entry.S` 在“最小内核”中顺利完成 **“搭栈桥 → 交接到 C”** 的使命。
-
-
-我用GDB设置了几个关键断点，具体观察启动过程中的各个环节：
+我用GDB设置了几个关键断点，具体观察启动过程中的各个环节,下面先介绍整体的运行流程，然后附上具体的终端输出进行分析：
 
 ### 3.1 成功进入kern_init
 
@@ -192,6 +100,238 @@ Breakpoint 3, sbi_console_putchar (ch=40 '(') at libs/sbi.c:33
 这些验证结果表明我们的启动机制设计是正确的，内核能够顺利从汇编世界过渡到C世界，并具备基本的输出能力。
 
 ---
+### 3.5 调试验证：从 `kern_entry` 到 `kern_init`
+
+在完成了代码阅读之后，我们使用 GDB 对内核启动的关键过程进行了逐步调试，验证了 **入口两条指令** 的作用，以及 **SP/PC 的正确设置**，并观察了跳转到 `kern_init` 后的执行情况。
+
+#### 调试目标
+1. 验证 `PC` 能正确从引导入口 `kern_entry` 跳转到 C 初始化函数 `kern_init`。
+2. 验证 `SP` 在 `kern_entry` 被设置为 `bootstacktop`，保证 C 语言运行环境可用。
+3. 确认 `kern_init` 中执行 `.bss` 段清零，并准备调用 `memset`。
+
+#### 调试过程
+
+首先，进入 QEMU 调试模式，并在 GDB 中连接：
+```bash
+make debug    # 启动 QEMU 等待调试
+make gdb      # 启动 GDB 并连接
+```
+
+##### 1) 命中内核入口并查看入口指令
+```gdb
+(gdb) b *kern_entry
+Breakpoint 1 at 0x80200000: file kern/init/entry.S, line 7.
+(gdb) c
+Breakpoint 1, kern_entry () at kern/init/entry.S:7
+7           la sp, bootstacktop
+(gdb) x/8i $pc
+=> 0x80200000 <kern_entry>:     auipc   sp,0x3
+   0x80200004 <kern_entry+4>:   mv      sp,sp
+   0x80200008 <kern_entry+8>:   j       0x8020000a <kern_init>
+   0x8020000a <kern_init>:      auipc   a0,0x3
+   0x8020000e <kern_init+4>:    addi    a0,a0,-2
+   0x80200012 <kern_init+8>:    auipc   a2,0x3
+   0x80200016 <kern_init+12>:   addi    a2,a2,-10
+```
+
+可以看到：
+- 第一条指令 `la sp, bootstacktop` 将栈指针初始化为内核栈顶。
+- 第三条指令 `j kern_init`（由 `tail kern_init` 汇编而来）将 **PC 无条件跳转**到 `kern_init`。
+
+##### 2) 单步观察 SP 的变化
+在执行入口指令前后查看栈指针：
+```gdb
+(gdb) i r sp
+sp             0x8001bd80   # 跳转前的旧 SP 值
+
+(gdb) si
+(gdb) i r sp
+sp             0x80203000   # 已更新为 bootstacktop
+```
+
+结果显示，执行 `la sp, bootstacktop` 后，SP 已经被正确设置为 0x80203000，对应我们在 `entry.S` 中定义的内核栈顶位置。  
+进一步可用以下命令验证栈大小：
+```gdb
+(gdb) p/x &bootstacktop - &bootstack
+$1 = 0x2000   # 8192 字节，即 2 页，符合 KSTACKSIZE 的定义
+```
+
+##### 3) 验证 PC 跳转到 C 入口
+继续单步执行，观察 PC 的变化：
+```gdb
+(gdb) si
+9           tail kern_init
+(gdb) si
+kern_init () at kern/init/init.c:8
+8           memset(edata, 0, end - edata);
+(gdb) i r pc
+pc             0x8020000a <kern_init>
+```
+
+可以看到，PC 已经从 `kern_entry` 正确跳转到 `kern_init` 的 C 源代码位置。这说明入口代码完成了“建立栈 → 跳转到初始化函数”的任务。
+
+##### 4) 观察 `kern_init` 中的指令序列
+```gdb
+(gdb) x/8i $pc
+=> 0x80200012 <kern_init+8>:    auipc   a2,0x3
+   0x80200016 <kern_init+12>:   addi    a2,a2,-10
+   0x8020001a <kern_init+16>:   addi    sp,sp,-16
+   0x8020001c <kern_init+18>:   li      a1,0
+   0x8020001e <kern_init+20>:   sub     a2,a2,a0
+   0x80200020 <kern_init+22>:   sd      ra,8(sp)
+   0x80200022 <kern_init+24>:   jal     ra,0x802004b6 <memset>
+```
+
+可以看到 `jal memset` 将被执行，用于清零 `.bss` 段，这正是实验要求中的关键步骤。
+
+#### 实验现象与结论
+
+1. **入口两条指令作用得到验证**：  
+   - `la sp, bootstacktop` 成功设置 SP 为内核栈顶。  
+   - `tail kern_init` 将 PC 跳转至 `kern_init`，进入 C 初始化。
+
+2. **SP 的正确性**：  
+   - SP 被置为 0x80203000，正好是 `bootstacktop`。  
+   - `bootstack` 与 `bootstacktop` 的差值为 0x2000，说明栈大小为 8KB，符合设计。
+
+3. **PC 的正确性**：  
+   - PC 从 `0x80200008` 跳转至 `0x8020000a <kern_init>`，说明控制流正确。
+   - 但是此处通过汇编代码可以发现调用了`j`跳转指令，跳转后的`PC`也是正常+4，这说明`<kern_init>`的指令就仅仅挨着`<kern_entry>`之后，哪怕不跳转也可以继续执行。但是这里我产生了一个问题：**为什么`<kern_init>`的指令就这么巧在`PC`的下一个呢？**
+   - 解答：在文件`kernel.ld`中，定义了
+   ```
+       .text : {
+        *(.text.kern_entry .text .stub .text.* .gnu.linkonce.t.*)
+    }
+    ```
+    把 `.text.kern_entry` 段（也就是 `kern_entry` 所在的那几条汇编）放在整个内核代码的最开头。紧接着就是所有其他 `.text` 段，此处下一个就是`init.c` 编译出来的 `kern_init`），因此指令相连。
+
+4. **初始化过程验证**：  
+   - 在 `kern_init` 中，准备调用 `memset` 清零 `.bss` 段，为后续 C 代码运行做好准备。
+
+### 3.6 Kern_init 内部调试过程
+
+##### 5) 进入 memset 验证 `.bss` 清零
+
+```gdb
+(gdb) b memset
+(gdb) c
+Breakpoint 2, memset (s=0x80203008, c=c@entry=0 '\000', n=0) at libs/string.c:275
+275         while (n -- > 0) {
+(gdb) info registers a0 a1 a2
+a0             0x80203008       2149593096
+a1             0x0      0
+a2             0x0      0
+```
+
+此时 `.bss` 段的起始地址为 `0x80203008`，长度为 0，说明在最小内核中 `.bss` 段实际上无需清空。
+`beqz a2, ret` 指令会直接返回，完成初始化逻辑。
+
+##### 6) 验证输出路径
+
+继续运行程序并设置输出相关断点：
+
+```gdb
+(gdb) b cprintf
+(gdb) b vcprintf
+(gdb) b vprintfmt
+(gdb) b cputch
+(gdb) b cons_putc
+(gdb) b sbi_console_putchar
+(gdb) c
+```
+
+触发 `cprintf` 调用：
+
+```
+cprintf(fmt="%s\n\n", message="(THU.CST) os is loading ...\n")
+```
+
+逐层进入函数并检查参数传递情况：
+
+* `a0=fmt`, `a1=message`：确认字符串常量地址正确。
+* `a0=cputch`, `a1=&cnt`, `a2=fmt`, `a3=ap`：`vcprintf` 参数传递正常。
+* `vprintfmt` 建立栈帧，`sp` 下移 128 字节，用于保存 `s` 系列寄存器。
+
+##### 7) 命中 cputch 并验证输出字符
+
+```gdb
+(gdb) b cputch
+(gdb) c
+Breakpoint 5, cputch (c=40, cnt=0x80202f94) at kern/libs/stdio.c:12
+12          cons_putc(c);
+(gdb) i r a0 a1
+a0 = 0x28 ('(')
+a1 = 0x80202f94
+```
+
+可以看到当前输出的字符为 `'('`，计数器的地址也正确。接下来 `cons_putc()` 会将该字符交给 SBI 接口进行输出。
+
+##### 8) 命中 cons_putc 并进入 sbi_console_putchar
+
+```gdb
+(gdb) s
+Breakpoint 6, cons_putc (c=40) at kern/driver/console.c:14
+14      sbi_console_putchar((unsigned char)c);
+(gdb) x/6i $pc
+=> 0x8020008c <cons_putc>:      zext.b  a0,a0
+   0x80200090 <cons_putc+4>:    j       0x80200480 <sbi_console_putchar>
+```
+
+`zext.b a0,a0` 指令将字符扩展为无符号字节，确保高位清零。随后通过 `j` 指令直接跳转到 `sbi_console_putchar()`，不保存返回地址，从而实现了“尾调用”优化。
+
+##### 9) 观察 SBI 调用与 ECALL
+
+```gdb
+(gdb) s
+Breakpoint 7, sbi_console_putchar (ch=40 '(') at libs/sbi.c:33
+33          sbi_call(SBI_CONSOLE_PUTCHAR, ch, 0, 0);
+(gdb) x/6i $pc
+=> 0x80200480 <sbi_console_putchar>:    li a5,0
+   0x80200482 <sbi_console_putchar+2>:  auipc a4,0x3
+   0x80200486 <sbi_console_putchar+6>:  ld a4,-1154(a4)
+   0x8020048a <sbi_console_putchar+10>: mv a7,a4
+```
+
+此时 `a0=0x28 ('(')`，`a7=1`（表示 SBI 调用号），执行 `ecall` 后陷入 M 模式，由 OpenSBI 完成字符输出。返回时 `a0=0`，说明调用执行成功。
+
+##### 10) 验证计数器自增
+
+```gdb
+(gdb) finish
+(gdb) x/wx 0x80202f94
+0x80202f94: 0x00000001
+```
+
+每输出一个字符，`(*cnt)` 的值都会增加 1，说明输出计数器工作正常。
+
+##### 11) 自动字符监控验证
+
+通过自定义命令链观察每次输出的字符：
+
+```gdb
+(gdb) b cputch
+(gdb) commands
+  silent
+  i r a0
+  printf "Output char: %c\n", (int)$a0
+  c
+end
+(gdb) c
+```
+
+输出结果如下（节选）：
+
+```
+Output char: (
+Output char: T
+```
+
+此处可以观察到字符流被逐个打印，验证了字符输出路径完全畅通。
+
+
+
+
+---
 
 ## 四、练习问题回答
 
@@ -202,6 +342,81 @@ Breakpoint 3, sbi_console_putchar (ch=40 '(') at libs/sbi.c:33
 **问题2：`tail kern_init`的作用和目的是什么？**  
 
 这条指令以尾调用方式跳转到C入口函数，它不会保存返回地址。这符合我们的设计意图——入口汇编代码只是一次性的跳板，完成基本设置后就应该"永不回头"地进入C世界进行更复杂的初始化工作。
+
+**问题3：RISC-V 加电后最初执行的指令与启动流程验证**
+
+**调试目标：** 追踪 CPU 从加电复位（0x1000）到内核入口（0x80200000）的全过程，确认最初指令的地址与作用。
+
+**调试步骤：**
+
+1. **启动 QEMU 并连接 GDB**
+
+   GDB 连接成功后显示：
+   ```
+   Remote debugging using localhost:1234
+   0x0000000000001000 in ?? ()
+   ```
+
+2. **查看复位向量处的前几条指令**
+
+   ```gdb
+   (gdb) x/10i $pc
+   => 0x1000:  auipc t0,0x0
+      0x1004:  addi  a1,t0,32
+      0x1008:  csrr  a0,mhartid
+      0x100c:  ld    t0,24(t0)
+      0x1010:  jr    t0
+   ```
+
+   这些是 QEMU 固件的最初几条汇编指令，用于初始化寄存器并跳转到 OpenSBI 固件入口。
+
+3. **验证内核入口执行**
+   启动时，QEMU在CPU运行前已将内核预装到 0x80200000,在内核入口设置 硬件断点，以捕捉 CPU 实际执行到该地址的时刻
+   ```gdb
+   (gdb) hbreak *0x80200000
+   (gdb) c   
+   ```
+
+   当 CPU 执行到该地址时触发断点：
+
+   ```
+   Breakpoint 1, kern_entry () at kern/init/entry.S:7
+   7           la sp, bootstacktop
+   ```
+
+   表明 OpenSBI 已完成初始化，并将控制权交给内核开始执行。
+
+4. **查看内核入口指令**
+
+   ```gdb
+   (gdb) b *0x80200000
+   (gdb) c
+   Breakpoint 2, 0x0000000080200000 in kern_entry ()
+   ```
+
+   说明控制权已转交至内核。继续查看：
+
+   ```gdb
+   (gdb) x/4i $pc
+   => 0x80200000 <kern_entry>: la sp, bootstacktop
+      0x80200004 <kern_entry+4>: tail kern_init
+   ```
+
+   可以看到内核的第一条指令为 `la sp, bootstacktop`，第二条为 `tail kern_init`，成功验证控制权已从 OpenSBI 转移到内核，并进入了 C 语言环境的初始化阶段。
+
+---
+
+**问题3：RISC-V 加电后最初执行的几条指令位于什么地址？它们主要完成了哪些功能？**
+
+* **指令地址：** 位于固定复位向量地址 `0x1000`。
+* **主要功能：**
+
+  1. 读取硬件线程 ID（`csrr a0, mhartid`）。
+  2. 从跳转表中取出 OpenSBI 入口地址（`ld t0, 24(t0)`）。
+  3. 跳转到 OpenSBI 执行（`jr t0`）。
+
+这几条指令组成了最小的引导序列，CPU 从 ROM 的复位向量 0x1000 开始执行，通过寄存器和跳转表找到 OpenSBI 的入口地址，从而把控制权交给固件。在 QEMU 的实验环境中，OpenSBI 运行在 0x80000000 附近，负责完成底层硬件初始化；随后它会将控制权移交给已经预加载在 0x80200000 的内核，此时 CPU 执行的第一条指令就是 la sp, bootstacktop，正式进入内核启动阶段。
+
 
 ---
 
@@ -233,4 +448,5 @@ Breakpoint 3, sbi_console_putchar (ch=40 '(') at libs/sbi.c:33
 
 通过这次实验，我深入理解了操作系统启动的第一步——从固件到内核的转交过程。`entry.S`虽然只有短短几行，却承担了至关重要的角色：设置好栈环境，并把控制权交给C代码。链接脚本精确控制了内核的装载位置，确保OpenSBI能顺利找到我们的内核入口。通过GDB调试，我验证了整个启动过程中的关键节点都符合预期。
 
-这个最小内核虽然功能简单，但它确实"活"了起来，成功打印出了启动信息，标志着我们迈出了操作系统开发的第一步。
+这个最小内核虽然功能简单，但它确实成功运行了起来，成功打印出了启动信息，标志着我们迈出了操作系统开发的第一步。
+
